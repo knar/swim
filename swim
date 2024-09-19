@@ -1,0 +1,170 @@
+#!/usr/bin/env fish
+#
+# chop up mp3s for a player with only prev/next seeking
+
+# source directory with mp3s, will be ordered by name
+set in_dir ~/dev/swim/in
+
+# output directory
+set out_dir ~/dev/swim/out
+
+# output files will look like `out_prefix`-HH-MM-SS.mp3
+set out_prefix book-title
+
+# tts voice and scale, https://github.com/rhasspy/piper/blob/master/VOICES.md
+set voice ~/.local/share/piper-voices/en_US-lessac-medium.onnx
+set voice_scale 1.0
+
+# defaults, can also be set with flags
+set time_reminder 600
+set segment_length 60
+set min_silence_length 0.8
+
+# temporary file
+set tmp_dir /tmp/swim
+set merged $tmp_dir/merged.mp3
+
+function reminder -a m
+    echo "$m minutes have gone by! I repeat, it's been $m minutes!"
+end
+
+function confirm -a warning
+    while true
+        read -l -P "$warning [y/N] " c
+        switch $c
+            case Y y
+                return
+            case '' N n
+                exit
+        end
+    end
+end
+
+function exit_with -a reason
+    echo $reason
+    exit
+end
+
+function fit -a inc
+    set target $inc
+    for i in (seq 1 (math (count $argv) - 1))
+        test $argv[(math $i + 1)] -ge $target; or continue
+        set -l a $argv[$i]
+        set -l b $argv[(math $i + 1)]
+        if test (math abs $target - $a) -lt (math abs $target - $b)
+            echo $a
+        else
+            echo $b
+        end
+        set target (math $target + $inc)
+    end
+end
+
+set progress_count 0
+function progress -a left total
+    set progress_count (math $progress_count + 1)
+    set w 40
+    test (math (string length -V $left) + $w) -le $COLUMNS; or set left (string shorten -m (math $COLUMNS - $w) $left)
+    set frac (math "$progress_count / $total")
+    set bar (string pad -r -w (math $w - 9) -c '-' (string repeat -n (math ceil "$frac * ($w - 9)") '#'))
+    set right (printf " [%s] %3d%% " $bar (math ceil "100 * $frac"))
+    set space (math $COLUMNS - (string length -V $right))
+    set left (string pad -r -w $space $left)
+    printf "\r%s%s" $left $right
+end
+
+function readable_seconds -a sec -a delimiter
+    set -q delimiter[1]; or set delimiter :
+    printf "%02d$delimiter%02d$delimiter%02d" (math floor $sec / 3600) (math floor \($sec / 60\) % 60) (math floor $sec % 60)
+end
+
+function print_help
+    printf "Usage: swim [flags]\n"
+    printf "\t-r, --reminder <seconds>        Set how often to splice in a TTS time reminder, default is 600\n"
+    printf "\t-s, --segment <seconds>         Set the preferred length of a segment, default is 60\n"
+    printf "\t-t, --silence <seconds>         Set the minimum length of a detected silence to be considered for a cut\n"
+    printf "\t-v, --verbose                   Print diagnostics before operation\n"
+    printf "\t-f, --force                     Never prompt to delete files or before operation\n"
+    printf "\t-h, --help                      Print this help page\n"
+    exit
+end
+
+argparse -X 0 'r/reminder=!_validate_int --min 30' 's/segment=!_validate_int --min 5' f/force v/verbose h/help -- $argv; or print_help
+set -q _flag_help; and print_help
+set -q _flag_reminder; and set time_reminder $_flag_reminder
+set -q _flag_segment; and set segment_length $_flag_segment
+
+for prog in find sed grep awk ffmpeg piper-tts lame
+    command -q $prog; or exit_with "Could not find dependency: $prog"
+end
+
+for dir in $in_dir $out_dir
+    test -d $dir; or exit_with "Could not find directory: $dir"
+end
+
+test -e $voice; or exit_with "Could not find voice file: $voice"
+test -e $voice.json; or exit_with "Could not find voice config file: $voice.json"
+
+test (count $in_dir/*.mp3) -gt 0; or exit_with "No mp3s found in: $(prompt_pwd -D 2 $in_dir)"
+
+if not test (count $out_dir/*mp3) -eq 0
+    set -q _flag_force; or confirm "There are $(count $out_dir/*.mp3) mp3s in $(prompt_pwd -D 2 $out_dir). Delete them?"
+    rm $out_dir/*.mp3
+end
+
+mkdir -p $tmp_dir
+test -e $merged; and rm $merged
+
+ffmpeg -v 8 -f concat -safe 0 -i (find $in_dir -iname '*.mp3' -printf "file '%p'\n" | sort | psub) -c copy $merged
+set total_len (ffprobe -i $merged -show_entries format=duration -v quiet -of csv="p=0")
+set pauses (ffmpeg -i $merged -af silencedetect=d=0.1 -f null - \
+    &| grep silence_end \
+    | awk -v tol=$min_silence_length '{ if ($8 > tol) print $5-$8*0.75 }')
+
+set reminders (fit $time_reminder $pauses)
+set cuts (fit $segment_length $pauses)
+
+if set -q _flag_verbose
+    echo "Total length: $(readable_seconds $total_len)"
+    echo "Pauses of minimum $min_silence_length seconds found: $(count $pauses)"
+
+    set -l err 0
+    set -l rem_targets (seq $time_reminder $time_reminder $total_len)
+    for i in (seq 1 (count $reminders))
+        set err (math $err + abs $rem_targets[$i] - $reminders[$i])
+    end
+    set err (math "$err / $(count $reminders)")
+    printf "Average reminder misalignment: %.1fs\n" $err
+
+    set err 0
+    set -l cut_targets (seq $segment_length $segment_length $total_len)
+    for i in (seq 1 (count $cuts))
+        set err (math $err + abs $cut_targets[$i] - $cuts[$i])
+    end
+    set err (math "$err / $(count $cuts)")
+    printf "Average segment misalignment: %.1fs\n" $err
+end
+
+set cuts 0 $cuts $reminders
+set cuts (echo $cuts | tr ' ' '\n' | sort -nu)
+set n_cuts (count $cuts)
+set n_total (math $n_cuts + (count $reminders))
+set -q _flag_force; or confirm "This operation will write $n_total mp3s to $(prompt_pwd -D 2 $out_dir). Continue?"
+for i in (seq 1 $n_cuts)
+    set -l start $cuts[$i]
+    set -l end $cuts[(math $i + 1)]
+    test $i -lt $n_cuts; or set end $total_len
+    set -l filename (printf "%s-%s" $out_prefix (readable_seconds $start -))
+
+    if contains $start $reminders
+        progress "Generating reminder: $filename-reminder.mp3" $n_total
+        set -l minutes (math "$time_reminder / 60 * (round $start / $time_reminder)")
+        reminder $minutes \
+            | piper-tts -q --model $voice --length_scale $voice_scale -f - \
+            | lame --silent - $out_dir/$filename-reminder.mp3
+    end
+
+    progress "Slicing: $filename.mp3 ($(readable_seconds (math $end - $start)))" $n_total
+    ffmpeg -v 16 -i $merged -ss $start -to $end -c copy $out_dir/$filename.mp3
+end
+printf "\nWoohoo!\n"
