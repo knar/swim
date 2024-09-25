@@ -3,10 +3,14 @@
 # chop up mp3s for a player with only prev/next seeking
 
 # source directory with mp3s, will be ordered by name
-set in_dir ~/dev/swim/in
+set in_dir ~/git/github.com/knar/swim/in
 
-# output directory
-set out_dir ~/dev/swim/out
+# directories with mp3s to include before and after the source
+set pre_dir ~/git/github.com/knar/swim/pre
+set post_dir ~/git/github.com/knar/swim/post
+
+# device mountpoint, must be path as written in /proc/mounts
+set device /home/zak/git/github.com/knar/swim/out
 
 # output files will look like `out_prefix`-HH-MM-SS.mp3
 set out_prefix book-title
@@ -20,9 +24,10 @@ set time_reminder 600
 set segment_length 60
 set min_silence_length 0.8
 
-# temporary file
+# temporary files
 set tmp_dir /tmp/swim
 set merged $tmp_dir/merged.mp3
+set stage_dir $tmp_dir/stage
 
 function reminder -a m
     echo "$m minutes have gone by! I repeat, it's been $m minutes!"
@@ -98,22 +103,26 @@ for prog in find sed grep awk ffmpeg piper-tts lame
     command -q $prog; or exit_with "Could not find dependency: $prog"
 end
 
-for dir in $in_dir $out_dir
+for dir in $in_dir $pre_dir $post_dir $device
     test -d $dir; or exit_with "Could not find directory: $dir"
 end
+
+grep -qs "$device " /proc/mounts; or exit_with "Could not find mounted device: $device"
 
 test -e $voice; or exit_with "Could not find voice file: $voice"
 test -e $voice.json; or exit_with "Could not find voice config file: $voice.json"
 
 test (count $in_dir/*.mp3) -gt 0; or exit_with "No mp3s found in: $(prompt_pwd -D 2 $in_dir)"
 
-if not test (count $out_dir/*mp3) -eq 0
-    set -q _flag_force; or confirm "There are $(count $out_dir/*.mp3) mp3s in $(prompt_pwd -D 2 $out_dir). Delete them?"
-    rm $out_dir/*.mp3
+if not test (count $device/*mp3) -eq 0
+    set -q _flag_force; or confirm "There are $(count $device/*.mp3) mp3s in $(prompt_pwd -D 2 $device). Delete them?"
+    rm $device/*.mp3
 end
 
 mkdir -p $tmp_dir
 test -e $merged; and rm $merged
+mkdir -p $stage_dir
+test (count $stage_dir/*mp3) -eq 0; or rm $stage_dir/*.mp3
 
 ffmpeg -v 8 -f concat -safe 0 -i (find $in_dir -iname '*.mp3' -printf "file '%p'\n" | sort | psub) -c copy $merged
 set total_len (ffprobe -i $merged -show_entries format=duration -v quiet -of csv="p=0")
@@ -147,9 +156,12 @@ end
 
 set cuts 0 $cuts $reminders
 set cuts (echo $cuts | tr ' ' '\n' | sort -nu)
+
 set n_cuts (count $cuts)
-set n_total (math $n_cuts + (count $reminders))
-set -q _flag_force; or confirm "This operation will write $n_total mp3s to $(prompt_pwd -D 2 $out_dir). Continue?"
+set n_mp3s (math $n_cuts + (count $reminders) + (count $pre_dir/*.mp3) + (count $post_dir/*.mp3))
+set n_ops (math $n_cuts + (count $reminders) + $n_mp3s)
+
+set -q _flag_force; or confirm "This operation will write $n_mp3s mp3s to $(prompt_pwd -D 2 $device). Continue?"
 for i in (seq 1 $n_cuts)
     set -l start $cuts[$i]
     set -l end $cuts[(math $i + 1)]
@@ -157,14 +169,25 @@ for i in (seq 1 $n_cuts)
     set -l filename (printf "%s-%s" $out_prefix (readable_seconds $start -))
 
     if contains $start $reminders
-        progress "Generating reminder: $filename-reminder.mp3" $n_total
+        progress "Generating reminder: $filename-reminder.mp3" $n_ops
         set -l minutes (math "$time_reminder / 60 * (round $start / $time_reminder)")
         reminder $minutes \
             | piper-tts -q --model $voice --length_scale $voice_scale -f - \
-            | lame --silent - $out_dir/$filename-reminder.mp3
+            | lame --silent - $stage_dir/$filename-reminder.mp3
     end
 
-    progress "Slicing: $filename.mp3 ($(readable_seconds (math $end - $start)))" $n_total
-    ffmpeg -v 16 -i $merged -ss $start -to $end -c copy $out_dir/$filename.mp3
+    progress "Slicing: $filename.mp3 ($(readable_seconds (math $end - $start)))" $n_ops
+    ffmpeg -v 16 -i $merged -ss $start -to $end -c copy $stage_dir/$filename.mp3
 end
+
+set mod (math (date +%s) - $n_mp3s)
+for dir in $pre_dir $stage_dir $post_dir
+    for file in $dir/*.mp3
+        progress "Copying: $(basename $file) to $device" $n_ops
+        cp $file $device
+        touch --date=@$mod $device/(basename $file)
+        set mod (math $mod + 1)
+    end
+end
+
 printf "\nWoohoo!\n"
