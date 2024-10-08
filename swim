@@ -2,32 +2,7 @@
 #
 # chop up mp3s for a player with only prev/next seeking
 
-# source directory with mp3s, will be ordered by name
-set in_dir ~/git/github.com/knar/swim/in
-
-# directories with mp3s to include before and after the source
-set pre_dir ~/git/github.com/knar/swim/pre
-set post_dir ~/git/github.com/knar/swim/post
-
-# device mountpoint, must be path as written in /proc/mounts
-set device /home/zak/git/github.com/knar/swim/out
-
-# output files will look like `out_prefix`-HH-MM-SS.mp3
-set out_prefix book-title
-
-# tts voice and scale, https://github.com/rhasspy/piper/blob/master/VOICES.md
-set voice ~/.local/share/piper-voices/en_US-lessac-medium.onnx
-set voice_scale 1.0
-
-# defaults, can also be set with flags
-set time_reminder 600
-set segment_length 60
-set min_silence_length 0.8
-
-# temporary files
-set tmp_dir /tmp/swim
-set merged $tmp_dir/merged.mp3
-set stage_dir $tmp_dir/stage
+source ~/.config/swim/config.fish
 
 function reminder -a m
     echo "$m minutes have gone by! I repeat, it's been $m minutes!"
@@ -52,7 +27,7 @@ end
 
 function fit -a inc
     set target $inc
-    for i in (seq 1 (math (count $argv) - 1))
+    for i in (seq 2 (math (count $argv) - 1))
         test $argv[(math $i + 1)] -ge $target; or continue
         set -l a $argv[$i]
         set -l b $argv[(math $i + 1)]
@@ -94,10 +69,11 @@ function print_help
     exit
 end
 
-argparse -X 0 'r/reminder=!_validate_int --min 30' 's/segment=!_validate_int --min 5' f/force v/verbose h/help -- $argv; or print_help
+argparse -X 0 'r/reminder=!_validate_int --min 30' 's/segment=!_validate_int --min 5' 't/silence=' f/force v/verbose h/help -- $argv; or print_help
 set -q _flag_help; and print_help
 set -q _flag_reminder; and set time_reminder $_flag_reminder
 set -q _flag_segment; and set segment_length $_flag_segment
+set -q _flag_silence; and set min_silence_length $_flag_silence
 
 for prog in find sed grep awk ffmpeg piper-tts lame
     command -q $prog; or exit_with "Could not find dependency: $prog"
@@ -107,7 +83,7 @@ for dir in $in_dir $pre_dir $post_dir $device
     test -d $dir; or exit_with "Could not find directory: $dir"
 end
 
-grep -qs "$device " /proc/mounts; or exit_with "Could not find mounted device: $device"
+grep -qs "$device_mount_search" /proc/mounts; or exit_with "Could not find mounted device: $device"
 
 test -e $voice; or exit_with "Could not find voice file: $voice"
 test -e $voice.json; or exit_with "Could not find voice config file: $voice.json"
@@ -126,7 +102,7 @@ test (count $stage_dir/*mp3) -eq 0; or rm $stage_dir/*.mp3
 
 ffmpeg -v 8 -f concat -safe 0 -i (find $in_dir -iname '*.mp3' -printf "file '%p'\n" | sort | psub) -c copy $merged
 set total_len (ffprobe -i $merged -show_entries format=duration -v quiet -of csv="p=0")
-set pauses (ffmpeg -i $merged -af silencedetect=d=0.1 -f null - \
+set pauses (ffmpeg -i $merged -af silencedetect=n=-48dB:d=0.1 -f null - \
     &| grep silence_end \
     | awk -v tol=$min_silence_length '{ if ($8 > tol) print $5-$8*0.75 }')
 
@@ -170,7 +146,7 @@ for i in (seq 1 $n_cuts)
 
     if contains $start $reminders
         progress "Generating reminder: $filename-reminder.mp3" $n_ops
-        set -l minutes (math "$time_reminder / 60 * (round $start / $time_reminder)")
+        set -l minutes (math round $start / 60)
         reminder $minutes \
             | piper-tts -q --model $voice --length_scale $voice_scale -f - \
             | lame --silent - $stage_dir/$filename-reminder.mp3
@@ -186,7 +162,7 @@ for dir in $pre_dir $stage_dir $post_dir
         progress "Copying: $(basename $file) to $device" $n_ops
         cp $file $device
         touch --date=@$mod $device/(basename $file)
-        set mod (math $mod + 1)
+        set mod (math $mod + 10)
     end
 end
 
